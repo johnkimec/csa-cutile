@@ -1,7 +1,8 @@
-"""Pure-PyTorch reference for Compressed Sparse Attention (DeepSeek-V4 §2.3.1).
+"""Pure-PyTorch reference for Compressed Sparse Attention (DeepSeek-V4 §2.3).
 
-Equations 9-19 from the paper, implemented for readability rather than speed.
-See docs/derivation.md for the paper-to-code map.
+Equations 9–19, the grouped output projection, and the §2.3.3 details
+(RMSNorm, partial RoPE, sliding-window KV, attention sink). Written for
+readability rather than speed. See docs/derivation.md for the paper-to-code map.
 """
 
 from __future__ import annotations
@@ -34,6 +35,37 @@ class CSAConfig:
     c_i: int
     causal: bool = True
     scale: Literal["sqrt_c", "none"] = "sqrt_c"
+    # Grouped output projection (§2.3.1). n_h must be divisible by n_groups.
+    # d_g is the per-group intermediate width; None picks group_width // 2.
+    n_groups: int = 1
+    d_g: int | None = None
+    # §2.3.3. rope_dim 0 disables RoPE. V4 uses the last 64 channels.
+    rope_dim: int = 0
+    rope_base: float = 10_000.0
+    # Recent uncompressed KV entries concatenated into core attention. 0 disables.
+    n_win: int = 0
+    rms_norm_eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if self.n_groups < 1 or self.n_h % self.n_groups != 0:
+            raise ValueError(f"n_groups={self.n_groups} must be a positive divisor of n_h={self.n_h}")
+        group_width = self.c * (self.n_h // self.n_groups)
+        if group_width < 2:
+            raise ValueError(f"group width c*n_h/n_groups={group_width} is too small for a grouped projection")
+        if self.d_g is None:
+            object.__setattr__(self, "d_g", group_width // 2)
+        if not isinstance(self.d_g, int) or not (1 <= self.d_g < group_width):
+            raise ValueError(f"d_g={self.d_g} must satisfy 1 <= d_g < group width {group_width}")
+        if self.rope_dim < 0 or self.rope_dim % 2 != 0:
+            raise ValueError(f"rope_dim={self.rope_dim} must be a non-negative even integer")
+        if self.rope_dim > self.c or self.rope_dim > self.c_i:
+            raise ValueError(f"rope_dim={self.rope_dim} must be <= c={self.c} and <= c_i={self.c_i}")
+        if self.n_win < 0:
+            raise ValueError(f"n_win={self.n_win} must be >= 0")
+        if self.rope_base <= 0:
+            raise ValueError(f"rope_base={self.rope_base} must be positive")
+        if self.rms_norm_eps <= 0:
+            raise ValueError(f"rms_norm_eps={self.rms_norm_eps} must be positive")
 
 
 @dataclass(frozen=True)
@@ -61,6 +93,21 @@ class CSAParams:
 
     # Core attention query up-projection (eq. 18).
     w_uq: torch.Tensor  # [d_c, c * n_h]
+
+    # RMSNorm scales, applied per head-dim before core attention (§2.3.3).
+    w_q_norm: torch.Tensor  # [c]
+    w_kv_norm: torch.Tensor  # [c]
+
+    # Per-head attention-sink logits (eq. 27).
+    sink: torch.Tensor  # [n_h]
+
+    # Grouped output projection. group_width = c * n_h / n_groups.
+    w_oa: torch.Tensor  # [n_groups, group_width, d_g]
+    w_ob: torch.Tensor  # [n_groups * d_g, d]
+
+    # Sliding-window uncompressed KV (§2.3.3). Unused when n_win == 0.
+    w_kv_win: torch.Tensor  # [d, c]
+    w_kv_win_norm: torch.Tensor  # [c]
 
 
 def _check_2d(name: str, x: torch.Tensor) -> None:
@@ -109,8 +156,6 @@ def _compress_overlapped(
         raise ValueError(f"sequence length n={n} must be divisible by m={m} for reference implementation")
 
     n_blk = n // m
-    device = c_a.device
-    dtype = c_a.dtype
 
     # [n_blk, m, c]
     c_a_blk = c_a.view(n_blk, m, c)
@@ -119,45 +164,160 @@ def _compress_overlapped(
     z_b_blk = z_b.view(n_blk, m, c)
 
     # Previous-block padding for i=0: logits=-inf, values=0.
-    neg_inf = torch.finfo(z_b.dtype).min if z_b.dtype.is_floating_point else -1e9
-    z_b_prev = torch.empty((n_blk, m, c), device=device, dtype=z_b.dtype)
-    c_b_prev = torch.empty((n_blk, m, c), device=device, dtype=dtype)
-    z_b_prev[0] = neg_inf
+    c_b_prev, z_b_prev = _shift_b_stream(c_b_blk, z_b_blk)
+    return _compress_from_streams(c_a=c_a_blk, c_b_prev=c_b_prev, z_a=z_a_blk, z_b_prev=z_b_prev, b_a=b_a, b_b=b_b)
+
+
+def _shift_b_stream(c_b_blk: torch.Tensor, z_b_blk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Block i reads block i-1's b-stream. Block 0 is zero values and -inf logits."""
+    n_blk = c_b_blk.shape[0]
+    neg_inf = torch.finfo(z_b_blk.dtype).min if z_b_blk.dtype.is_floating_point else -1e9
+    c_b_prev = torch.empty_like(c_b_blk)
+    z_b_prev = torch.empty_like(z_b_blk)
     c_b_prev[0] = 0
+    z_b_prev[0] = neg_inf
     if n_blk > 1:
-        z_b_prev[1:] = z_b_blk[:-1]
         c_b_prev[1:] = c_b_blk[:-1]
+        z_b_prev[1:] = z_b_blk[:-1]
+    return c_b_prev, z_b_prev
 
-    # Add positional biases (learnable) then softmax over the 2m "row" dimension (eq. 11).
-    # logits: [n_blk, 2m, c]
-    logits_a = z_a_blk + b_a.view(1, m, c)
-    logits_b = z_b_prev + b_b.view(1, m, c)
-    logits = torch.cat([logits_a, logits_b], dim=1)
-    s = torch.softmax(logits, dim=1)  # Softmaxrow
-    s_a, s_b = s[:, :m, :], s[:, m:, :]
 
-    # Weighted sum with Hadamard product, then sum over tokens (eq. 12).
-    c_comp = (s_a * c_a_blk).sum(dim=1) + (s_b * c_b_prev).sum(dim=1)  # [n_blk, c]
-    return c_comp
+def _compress_from_streams(
+    *,
+    c_a: torch.Tensor,
+    c_b_prev: torch.Tensor,
+    z_a: torch.Tensor,
+    z_b_prev: torch.Tensor,
+    b_a: torch.Tensor,
+    b_b: torch.Tensor,
+) -> torch.Tensor:
+    """One overlapped compression step (eqs. 11–12).
+
+    Token axis is -2, so this accepts `[m, c]` or `[batch, m, c]` (and the
+    vectorized `[n_blk, m, c]` layout). Biases are `[m, c]` and broadcast.
+    Returns the compressed vector with the token axis removed.
+    """
+    # logits: [..., 2m, c]. Softmax over the 2m row axis (eq. 11).
+    logits = torch.cat([z_a + b_a, z_b_prev + b_b], dim=-2)
+    s = torch.softmax(logits, dim=-2)
+    m = c_a.shape[-2]
+    s_a, s_b = s[..., :m, :], s[..., m:, :]
+    # Hadamard-weighted sum over the token axis (eq. 12).
+    return (s_a * c_a).sum(dim=-2) + (s_b * c_b_prev).sum(dim=-2)
+
+
+def _b_stream_padding(like: torch.Tensor, m: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero values and -inf logits with shape `[..., m, c]`, matching block 0."""
+    neg_inf = torch.finfo(like.dtype).min if like.dtype.is_floating_point else -1e9
+    c_pad = torch.zeros(*like.shape[:-1], m, like.shape[-1], device=like.device, dtype=like.dtype)
+    z_pad = torch.empty_like(c_pad)
+    z_pad.fill_(neg_inf)
+    return c_pad, z_pad
+
+
+def _rms_norm(x: torch.Tensor, weight: torch.Tensor, *, eps: float) -> torch.Tensor:
+    """RMSNorm over the last dimension, with a learnable per-channel scale.
+
+    Matches the usual DeepSeek form: x * rsqrt(mean(x^2) + eps) * weight,
+    computed in fp32. `weight` has shape `[x.shape[-1]]`.
+    """
+    _check_shape("weight", weight, (x.shape[-1],))
+    xf = x.float()
+    scale = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (xf * scale * weight.float()).to(dtype=x.dtype)
+
+
+def _rope_cos_sin(
+    positions: torch.Tensor,
+    rope_dim: int,
+    base: float,
+    *,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Interleaved-RoPE cos/sin for `positions`, expanded to `rope_dim` channels.
+
+    Frequencies follow the usual θ_i = base^(-2i/dim) over pairs. The returned
+    tensors have shape `positions.shape + (rope_dim,)` and are ready for
+    `_apply_rope` (no extra repeat). `rope_dim == 0` returns empty trailing dims.
+    """
+    if rope_dim == 0:
+        empty = torch.empty(*positions.shape, 0, device=positions.device, dtype=dtype)
+        return empty, empty
+    if rope_dim % 2 != 0:
+        raise ValueError(f"rope_dim={rope_dim} must be even")
+    pair = torch.arange(0, rope_dim, 2, device=positions.device, dtype=torch.float32)
+    inv_freq = 1.0 / (base ** (pair / rope_dim))
+    freqs = positions.to(dtype=torch.float32).unsqueeze(-1) * inv_freq
+    cos = freqs.cos().repeat_interleave(2, dim=-1)
+    sin = freqs.sin().repeat_interleave(2, dim=-1)
+    return cos.to(dtype=dtype), sin.to(dtype=dtype)
+
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Interleaved half-rotation: (x0, x1, x2, x3, ...) -> (-x1, x0, -x3, x2, ...)."""
+    x1 = x[..., 0::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply interleaved RoPE to the trailing `cos.shape[-1]` channels of `x`.
+
+    Leading channels are left alone. `cos` and `sin` broadcast over any head
+    dimension sitting between the position axis and the channel axis.
+    """
+    rope_dim = cos.shape[-1]
+    if rope_dim == 0:
+        return x
+    nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]
+    rotated = (rope.float() * cos.float()) + (_rotate_half(rope).float() * sin.float())
+    return torch.cat([nope, rotated.to(dtype=x.dtype)], dim=-1)
 
 
 def _core_attn_mqa(
     *,
     q: torch.Tensor,  # [n_h, c]
     kv: torch.Tensor,  # [k, c]
+    sink: torch.Tensor,  # [n_h]
     scale: Literal["sqrt_c", "none"] = "sqrt_c",
 ) -> torch.Tensor:
-    """Multi-query core attention (eq. 19). Returns `[n_h, c]`."""
+    """Multi-query core attention (eq. 19) with an attention sink (eq. 27).
+
+    Returns `[n_h, c]`. The sink logit is an extra softmax column that is
+    dropped before the value mix, so the attention weights sum to less than 1.
+    """
     _check_shape("q", q, (None, None))
     _check_shape("kv", kv, (None, None))
+    _check_shape("sink", sink, (q.shape[0],))
     if q.shape[1] != kv.shape[1]:
         raise ValueError(f"q and kv must share last dim c; got q={tuple(q.shape)} kv={tuple(kv.shape)}")
+    if kv.shape[0] == 0:
+        return torch.zeros_like(q)
     c = q.shape[1]
     logits = q @ kv.T  # [n_h, k]
     if scale == "sqrt_c":
         logits = logits / (c**0.5)
-    attn = torch.softmax(logits, dim=-1)
+    # eq. 27 — Exp(z'_h) joins the denominator. Sink is not scaled by 1/sqrt(c).
+    combined = torch.cat([logits, sink.to(dtype=logits.dtype).unsqueeze(-1)], dim=-1)
+    attn = torch.softmax(combined, dim=-1)[..., :-1]
     return attn @ kv  # [n_h, c]
+
+
+def _grouped_output(o: torch.Tensor, w_oa: torch.Tensor, w_ob: torch.Tensor) -> torch.Tensor:
+    """Grouped output projection (§2.3.1). `o` is `[n, n_h, c]` and the result is `[n, d]`.
+
+    Heads are split into `g` groups. Each group is projected to `d_g`, then the
+    concatenated intermediate is projected to the model hidden size.
+    """
+    n = o.shape[0]
+    _check_shape("w_oa", w_oa, (None, None, None))
+    g, group_width, d_g = w_oa.shape
+    if o.reshape(n, -1).shape[-1] != g * group_width:
+        raise ValueError(f"o flattened width {o.shape[1] * o.shape[2]} != n_groups * group_width {g * group_width}")
+    _check_shape("w_ob", w_ob, (g * d_g, None))
+    grouped = o.reshape(n, g, group_width)
+    mid = torch.einsum("ngi,gio->ngo", grouped, w_oa)
+    return mid.reshape(n, g * d_g) @ w_ob
 
 
 @torch.no_grad()
@@ -169,10 +329,13 @@ def csa_reference(
 ) -> dict[str, torch.Tensor]:
     """CSA forward for a single sequence.
 
-    Returns a dict with `c_comp [n_blk, c]`, `k_i_comp [n_blk, c_i]`,
-    `i_scores [n, n_blk]` (masked with -inf for non-visible blocks),
-    `topk_idx [n, k]` (-1 padding for early tokens with fewer than k visible
-    blocks), and `o [n, n_h, c]`.
+    Returns a dict with `c_comp [n_blk, c]` and `k_i_comp [n_blk, c_i]` (the
+    compression outputs, before RMSNorm and RoPE), `i_scores [n, n_blk]`
+    (masked with -inf for non-visible blocks; RoPE is included when
+    `cfg.rope_dim > 0`), `topk_idx [n, k]` (-1 padding for early tokens with
+    fewer than k visible blocks), `o [n, n_h, c]` (core-attention outputs
+    after the inverse-RoPE countermeasure), and `y [n, d]` (grouped output
+    projection of `o`).
     """
     _check_2d("h", h)
     n, d = h.shape
@@ -215,9 +378,20 @@ def csa_reference(
     q_i = (c_q @ p.w_iuq).view(n, cfg.n_h_i, cfg.c_i)  # [n, n_h_i, c_i] (eq. 14)
     w_i = h @ p.w_w  # [n, n_h_i] (eq. 15)
 
+    # Partial RoPE (§2.3.3) on indexer queries and compressed indexer keys.
+    # Compressed entry i is placed at absolute position i * m, the first token
+    # of that block. The paper specifies the rotation but not this index; i*m
+    # is the position used by the V4 attention code.
+    token_pos = torch.arange(n, device=h.device)
+    blk_pos = torch.arange(n_blk, device=h.device) * m
+    cos_t, sin_t = _rope_cos_sin(token_pos, cfg.rope_dim, cfg.rope_base, dtype=h.dtype)
+    cos_b, sin_b = _rope_cos_sin(blk_pos, cfg.rope_dim, cfg.rope_base, dtype=h.dtype)
+    q_i = _apply_rope(q_i, cos_t[:, None, :], sin_t[:, None, :])
+    k_i_rope = _apply_rope(k_i_comp, cos_b, sin_b)
+
     # Scores I_{t,s} for s < floor(t/m) (eq. 16).
     # dot: [n, n_h_i, n_blk]
-    dot = torch.einsum("tnc,sc->tns", q_i, k_i_comp)  # q·K
+    dot = torch.einsum("tnc,sc->tns", q_i, k_i_rope)  # q·K
     dot = torch.relu(dot)
     i_scores = torch.einsum("tn,tns->ts", w_i, dot)  # sum_h w * relu(dot)
 
@@ -239,18 +413,52 @@ def csa_reference(
 
     # eq. 18: core attention queries from shared c_q
     _check_shape("p.w_uq", p.w_uq, (cfg.d_c, cfg.c * cfg.n_h))
+    _check_shape("p.w_q_norm", p.w_q_norm, (cfg.c,))
+    _check_shape("p.w_kv_norm", p.w_kv_norm, (cfg.c,))
+    _check_shape("p.sink", p.sink, (cfg.n_h,))
     q = (c_q @ p.w_uq).view(n, cfg.n_h, cfg.c)  # [n, n_h, c]
 
-    # eq. 19: MQA over selected compressed KV blocks.
+    # §2.3.3: RMSNorm each query head and the compressed KV head, then RoPE
+    # on the trailing rope_dim channels, just before core attention.
+    q = _rms_norm(q, p.w_q_norm, eps=cfg.rms_norm_eps)
+    c_comp_attn = _rms_norm(c_comp, p.w_kv_norm, eps=cfg.rms_norm_eps)
+    q = _apply_rope(q, cos_t[:, None, :], sin_t[:, None, :])
+    c_comp_attn = _apply_rope(c_comp_attn, cos_b, sin_b)
+
+    # Sliding-window branch (§2.3.3): n_win uncompressed KV entries for the
+    # most recent tokens, including the current one. Separate projection from
+    # the compressor. Empty when n_win == 0.
+    _check_shape("p.w_kv_win", p.w_kv_win, (d, cfg.c))
+    _check_shape("p.w_kv_win_norm", p.w_kv_win_norm, (cfg.c,))
+    kv_win = _rms_norm(h @ p.w_kv_win, p.w_kv_win_norm, eps=cfg.rms_norm_eps)
+    kv_win = _apply_rope(kv_win, cos_t, sin_t)
+
+    # eq. 19: MQA over the sliding-window KV and the selected compressed blocks.
     o = torch.empty((n, cfg.n_h, cfg.c), device=h.device, dtype=h.dtype)
     for t in range(n):
-        idx = topk_idx[t]  # [k]
+        parts: list[torch.Tensor] = []
+        if cfg.n_win > 0:
+            start = max(0, t - cfg.n_win + 1)
+            parts.append(kv_win[start : t + 1])
+        idx = topk_idx[t]
         idx = idx[idx >= 0]
-        if idx.numel() == 0:
+        if idx.numel() > 0:
+            parts.append(c_comp_attn.index_select(0, idx))
+        if not parts:
             o[t].zero_()
             continue
-        kv_t = c_comp.index_select(0, idx)  # [k_eff, c]
-        o[t] = _core_attn_mqa(q=q[t], kv=kv_t, scale=cfg.scale)
+        kv_t = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        o[t] = _core_attn_mqa(q=q[t], kv=kv_t, sink=p.sink, scale=cfg.scale)
+
+    # K and V are the same rotated vectors, so o carries absolute positions.
+    # RoPE at -t (cos, -sin at the query position) puts the mix back in terms
+    # of the query-to-KV distance (§2.3.3).
+    o = _apply_rope(o, cos_t[:, None, :], -sin_t[:, None, :])
+
+    group_width = cfg.c * (cfg.n_h // cfg.n_groups)
+    _check_shape("p.w_oa", p.w_oa, (cfg.n_groups, group_width, cfg.d_g))
+    _check_shape("p.w_ob", p.w_ob, (cfg.n_groups * cfg.d_g, d))
+    y = _grouped_output(o, p.w_oa, p.w_ob)
 
     return {
         "c_comp": c_comp,
@@ -258,6 +466,7 @@ def csa_reference(
         "i_scores": i_scores,
         "topk_idx": topk_idx,
         "o": o,
+        "y": y,
     }
 
 
@@ -270,13 +479,26 @@ def random_params(
     generator: torch.Generator | None = None,
     std: float = 0.02,
 ) -> CSAParams:
-    """CSAParams with N(0, std^2) projections and biases. For tests and demos."""
+    """CSAParams with N(0, std^2) projections and biases. For tests and demos.
+
+    RMSNorm scales start at 1. The sink logit starts at 0, which still adds
+    exp(0) = 1 to the core-attention denominator.
+    """
 
     def randn(*shape: int) -> torch.Tensor:
         t = torch.empty(*shape, device=device, dtype=dtype)
         t.normal_(mean=0.0, std=std, generator=generator)
         return t
 
+    def ones(*shape: int) -> torch.Tensor:
+        return torch.ones(*shape, device=device, dtype=dtype)
+
+    def zeros(*shape: int) -> torch.Tensor:
+        return torch.zeros(*shape, device=device, dtype=dtype)
+
+    group_width = cfg.c * (cfg.n_h // cfg.n_groups)
+    d_g = cfg.d_g
+    assert d_g is not None  # set in CSAConfig.__post_init__
     return CSAParams(
         w_a_kv=randn(d, cfg.c),
         w_b_kv=randn(d, cfg.c),
@@ -294,5 +516,11 @@ def random_params(
         w_iuq=randn(cfg.d_c, cfg.c_i * cfg.n_h_i),
         w_w=randn(d, cfg.n_h_i),
         w_uq=randn(cfg.d_c, cfg.c * cfg.n_h),
+        w_q_norm=ones(cfg.c),
+        w_kv_norm=ones(cfg.c),
+        sink=zeros(cfg.n_h),
+        w_oa=randn(cfg.n_groups, group_width, d_g),
+        w_ob=randn(cfg.n_groups * d_g, d),
+        w_kv_win=randn(d, cfg.c),
+        w_kv_win_norm=ones(cfg.c),
     )
-

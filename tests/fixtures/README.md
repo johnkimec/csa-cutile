@@ -1,7 +1,11 @@
 # Fixtures
 
-Tensors captured from DeepSeek-V4's reference inference impl, used to validate
-`src/csa/reference.py` bitwise. None present yet.
+Bitwise tensors captured from DeepSeek-V4 inference are deferred. That stack is
+not runnable on the Apple Silicon machine this repo is developed on. Correctness
+for now is the structural tests in `tests/test_reference.py`.
+
+The capture protocol below is notes for a later NVIDIA-GPU pass. Do not block
+reference work on it.
 
 ## Capture protocol
 

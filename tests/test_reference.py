@@ -1,9 +1,9 @@
 """Structural-invariant tests for src/csa/reference.py.
 
 Covers shapes, causality, top-k correctness, the softmax property of eq. 11,
-the i = 0 boundary, determinism, the k = n_blk degenerate case, and shape
-validation. See tests/fixtures/README.md for the (currently absent) bitwise
-oracle layer.
+the i = 0 boundary, determinism, the k = n_blk degenerate case, shape
+validation, and the §2.3.3 pieces (RMSNorm, RoPE, sliding window, sink,
+grouped output projection).
 """
 
 from __future__ import annotations
@@ -12,7 +12,14 @@ import pytest
 import torch
 
 from csa import CSAConfig, csa_reference, random_params
-from csa.reference import _compress_overlapped, _core_attn_mqa
+from csa.reference import (
+    _apply_rope,
+    _compress_overlapped,
+    _core_attn_mqa,
+    _grouped_output,
+    _rms_norm,
+    _rope_cos_sin,
+)
 
 
 def test_output_shapes_and_dtypes(small_case):
@@ -26,9 +33,11 @@ def test_output_shapes_and_dtypes(small_case):
     assert out["i_scores"].shape == (n, n_blk)
     assert out["topk_idx"].shape == (n, cfg.k)
     assert out["o"].shape == (n, cfg.n_h, cfg.c)
+    assert out["y"].shape == (n, small_case.h.shape[1])
 
     assert out["c_comp"].dtype == small_case.h.dtype
     assert out["o"].dtype == small_case.h.dtype
+    assert out["y"].dtype == small_case.h.dtype
     assert out["topk_idx"].dtype == torch.int64
 
 
@@ -143,14 +152,15 @@ def test_k_equals_n_blocks_matches_dense_mqa_over_compressed(k_equals_blocks_cas
     cfg = case.cfg
     n = case.h.shape[0]
 
+    assert cfg.rope_dim == 0 and cfg.n_win == 0
     c_q = case.h @ case.p.w_dq
-    q = (c_q @ case.p.w_uq).view(n, cfg.n_h, cfg.c)
-    c_comp = out["c_comp"]
+    q = _rms_norm((c_q @ case.p.w_uq).view(n, cfg.n_h, cfg.c), case.p.w_q_norm, eps=cfg.rms_norm_eps)
+    c_comp = _rms_norm(out["c_comp"], case.p.w_kv_norm, eps=cfg.rms_norm_eps)
 
     for t in range(cfg.m, n):
         cap = t // cfg.m
         kv = c_comp[:cap]
-        expected = _core_attn_mqa(q=q[t], kv=kv, scale=cfg.scale)
+        expected = _core_attn_mqa(q=q[t], kv=kv, sink=case.p.sink, scale=cfg.scale)
         assert torch.allclose(out["o"][t], expected, atol=1e-5), f"mismatch at t={t}"
 
     for t in range(cfg.m):
@@ -175,3 +185,95 @@ def test_shape_validation_errors():
     p_overk = random_params(cfg=cfg_overk, d=8, generator=g)
     with pytest.raises(ValueError, match="cfg.k"):
         csa_reference(h=h, cfg=cfg_overk, p=p_overk)
+
+    with pytest.raises(ValueError, match="n_groups"):
+        CSAConfig(m=4, k=2, n_h=4, n_h_i=2, d_c=8, c=4, c_i=2, n_groups=3)
+
+    with pytest.raises(ValueError, match="rope_dim"):
+        CSAConfig(m=4, k=2, n_h=2, n_h_i=2, d_c=8, c=4, c_i=2, rope_dim=64)
+
+
+def test_rms_norm_matches_definition():
+    torch.manual_seed(0)
+    x = torch.randn(5, 4)
+    w = torch.randn(4)
+    eps = 1e-6
+    y = _rms_norm(x, w, eps=eps)
+    expected = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps) * w
+    assert torch.allclose(y, expected.to(y.dtype), atol=1e-6)
+
+
+def test_attention_sink_reduces_mass_and_drops_the_column():
+    """eq. 27: sink is an extra softmax logit and does not multiply a value."""
+    torch.manual_seed(1)
+    q = torch.randn(2, 4)
+    kv = torch.randn(3, 4)
+    sink = torch.tensor([0.5, -1.0])
+    out = _core_attn_mqa(q=q, kv=kv, sink=sink, scale="sqrt_c")
+
+    logits = (q @ kv.T) / (4**0.5)
+    probs = torch.softmax(torch.cat([logits, sink[:, None]], dim=-1), dim=-1)[..., :-1]
+    assert torch.allclose(out, probs @ kv, atol=1e-6)
+    assert torch.all(probs.sum(-1) < 1)
+
+    killed = _core_attn_mqa(q=q, kv=kv, sink=torch.full((2,), 1e6), scale="none")
+    assert torch.allclose(killed, torch.zeros_like(killed), atol=1e-5)
+
+
+def test_grouped_output_matches_two_matmuls(small_case):
+    out = csa_reference(h=small_case.h, cfg=small_case.cfg, p=small_case.p)
+    y = _grouped_output(out["o"], small_case.p.w_oa, small_case.p.w_ob)
+    assert torch.allclose(out["y"], y, atol=1e-6)
+
+
+def test_rope_dot_product_depends_on_relative_position():
+    """Interleaved RoPE: q at p and k at s matches q at 0 and k at s-p, on the rope slice."""
+    torch.manual_seed(2)
+    c, rope_dim, base = 8, 4, 10_000.0
+    q = torch.randn(c)
+    k = torch.randn(c)
+    p, s = 5, 2
+
+    def rope_at(x: torch.Tensor, pos: int) -> torch.Tensor:
+        cos, sin = _rope_cos_sin(torch.tensor(pos), rope_dim, base, dtype=x.dtype)
+        return _apply_rope(x, cos, sin)
+
+    direct = torch.dot(rope_at(q, p), rope_at(k, s))
+    relative = torch.dot(rope_at(q, 0), rope_at(k, s - p))
+    assert torch.allclose(direct, relative, atol=1e-5)
+
+    # Inverse rotation at the query position undoes a key rotation down to the relative one.
+    roped_v = rope_at(k, s)
+    cos_p, sin_p = _rope_cos_sin(torch.tensor(p), rope_dim, base, dtype=k.dtype)
+    undone = _apply_rope(roped_v, cos_p, -sin_p)
+    assert torch.allclose(undone, rope_at(k, s - p), atol=1e-5)
+
+
+def test_sliding_window_attends_locally_and_not_to_the_future():
+    """n_win > 0: token 0 has a local KV even though no compressed block is visible.
+
+    Tokens strictly after t do not change o[t] or y[t].
+    """
+    torch.manual_seed(3)
+    cfg = CSAConfig(m=4, k=2, n_h=4, n_h_i=2, d_c=16, c=8, c_i=4, n_win=3, rope_dim=4)
+    g = torch.Generator().manual_seed(3)
+    n, d = 16, 24
+    h = torch.empty(n, d).normal_(generator=g)
+    p = random_params(cfg=cfg, d=d, generator=g)
+    p = type(p)(**{**p.__dict__, "sink": torch.full((cfg.n_h,), -1e9)})
+
+    out = csa_reference(h=h, cfg=cfg, p=p)
+    assert not torch.allclose(out["o"][0], torch.zeros_like(out["o"][0]))
+
+    kv0 = _rms_norm(h[0] @ p.w_kv_win, p.w_kv_win_norm, eps=cfg.rms_norm_eps)
+    # Position 0 is an identity rotation, and RMSNorm runs per head (width c).
+    q0 = _rms_norm(((h[0] @ p.w_dq) @ p.w_uq).view(cfg.n_h, cfg.c), p.w_q_norm, eps=cfg.rms_norm_eps)
+    expected0 = _core_attn_mqa(q=q0, kv=kv0.unsqueeze(0), sink=p.sink, scale=cfg.scale)
+    assert torch.allclose(out["o"][0], expected0, atol=1e-5)
+
+    t = 6
+    h2 = h.clone()
+    h2[t + 1 :] += 1
+    out2 = csa_reference(h=h2, cfg=cfg, p=p)
+    assert torch.allclose(out["o"][t], out2["o"][t], atol=1e-5)
+    assert torch.allclose(out["y"][t], out2["y"][t], atol=1e-5)
