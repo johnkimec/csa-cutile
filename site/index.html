@@ -25,7 +25,6 @@
     color-scheme: light;
   }
   * { box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
   body {
     margin: 0;
     background: var(--paper);
@@ -34,22 +33,15 @@
     font-size: 19px;
     line-height: 1.45;
   }
-  @media (prefers-reduced-motion: reduce) {
-    html { scroll-behavior: auto; }
-  }
-  a { color: inherit; }
   code { font-family: inherit; font-size: 0.92em; }
   sub, sup { font-family: inherit; font-size: 0.7em; line-height: 0; }
   h1, h2, h3 { text-wrap: balance; font-weight: 400; }
   p { text-wrap: pretty; }
   .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; padding-bottom: 56px; }
   header {
-    display: flex; justify-content: space-between; align-items: baseline;
     padding: 28px 0 0;
     font-size: 16px;
   }
-  header a { color: var(--muted); text-decoration: none; margin-left: 18px; }
-  header a:hover, header a:focus-visible { color: var(--ink); }
   .hero {
     display: grid;
     grid-template-columns: minmax(0, 1.05fr) minmax(280px, 0.95fr);
@@ -69,8 +61,6 @@
   .figure { margin: 0 0 8px; }
   @media (max-width: 800px) {
     .hero { grid-template-columns: 1fr; }
-    header { flex-direction: column; align-items: flex-start; gap: 8px; }
-    header nav { margin-left: -18px; }
   }
 </style>
 </head>
@@ -78,12 +68,6 @@
 <div class="wrap">
   <header>
     <span>csa</span>
-    <nav>
-      <a href="#compress">Compression</a>
-      <a href="#index">Indexer</a>
-      <a href="#attend">Attention</a>
-      <a href="#cache">Cache</a>
-    </nav>
   </header>
 
   <div class="hero">
