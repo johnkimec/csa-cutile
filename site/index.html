@@ -96,11 +96,6 @@
       <svg viewBox="0 0 640 230" role="img" aria-labelledby="hero-title hero-desc">
         <title id="hero-title">Overlapped compression of two blocks into one entry</title>
         <desc id="hero-desc">Four b-stream tokens from the previous block and four a-stream tokens from the current block feed one softmax, which produces a single compressed KV entry.</desc>
-        <defs>
-          <marker id="ah-hero" markerUnits="userSpaceOnUse" markerWidth="12" markerHeight="12" refX="11" refY="6" orient="auto">
-            <path d="M1 1 L11 6 L1 11" fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="butt" stroke-linejoin="miter"/>
-          </marker>
-        </defs>
         <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
           <path d="M48 58 h46 v34 h-46 z"/>
           <path d="M102 56 h46 v34 h-46 z"/>
@@ -117,9 +112,10 @@
         </g>
         <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M233 168 h160 v46 h-160 z"/>
-          <path d="M152 94 C210 136 270 150 313 152"/>
-          <path d="M396 94 C340 136 350 150 313 152"/>
-          <path d="M313 152 V168" marker-end="url(#ah-hero)"/>
+          <path d="M152 94 C210 136 270 146 313 146"/>
+          <path d="M396 94 C340 136 356 146 313 146"/>
+          <path d="M313 146 V168"/>
+          <path d="M304 157 L313 168 L322 157" stroke-linejoin="miter"/>
         </g>
         <text x="293" y="196" fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="18">C<tspan font-size="12" baseline-shift="super">Comp</tspan></text>
       </svg>
