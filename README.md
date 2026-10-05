@@ -7,8 +7,7 @@ and dropped into other models.
 
 The PyTorch code in `src/csa/reference.py` is meant to be readable, not fast.
 Development is on Apple Silicon with no CUDA device, so fused Triton kernels, a
-cuTile port, and long-context model demos are out of scope until an NVIDIA GPU
-is available.
+cuTile port, and long-context model demos are out of scope (resource gated). 
 
 A walk through the diagrams is at <https://jvkec.github.io/csa-cutile/>.
 
