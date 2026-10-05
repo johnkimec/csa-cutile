@@ -10,6 +10,10 @@ Development is on Apple Silicon with no CUDA device, so fused Triton kernels, a
 cuTile port, and long-context model demos are out of scope until an NVIDIA GPU
 is available.
 
+A walk through the diagrams is at <https://jvkec.github.io/csa-cutile/>.
+
+[![csa site](site/preview.png)](https://jvkec.github.io/csa-cutile/)
+
 ## Install
 
 ```bash
@@ -40,7 +44,7 @@ python bench/bench_attention.py --n 1024 --d 256 --m 16 --k 8
 ```
 src/csa/reference.py     single-sequence CSA, paper eqs. 9–19 and §2.3.3
 src/csa/module.py        batched CSA module and incremental KV cache
-src/csa/__init__.py      public API: CSAConfig, CSAParams, csa_reference, random_params
+src/csa/__init__.py      public API: CSA, CSACache, CSAConfig, CSAParams, csa_reference, random_params
 tests/                   structural-invariant tests for the reference
 bench/bench_attention.py mem ratio, tok/s, cosine sim vs. dense MQA
 demo/walkthrough.py      v0 demo: small example + plots
