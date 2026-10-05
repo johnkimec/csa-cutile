@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>csa</title>
+<meta name="description" content="How Compressed Sparse Attention turns a sequence into a few KV entries, then attends to k of them.">
+<link rel="icon" href="icon.svg" type="image/svg+xml" sizes="any">
+<style>
+  @font-face {
+    font-family: "Excalifont";
+    src: url("fonts/Excalifont-Regular.woff2") format("woff2");
+    font-weight: 400;
+    font-style: normal;
+    font-display: swap;
+  }
+  :root {
+    --paper: #f4f3ef;
+    --ink: #1c1c1c;
+    --muted: #5e5e5a;
+    --faint: #8a8a84;
+    --line: #d9d7d0;
+    --wash: #e7e5df;
+    --card: #fbfaf7;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Excalifont, "Segoe Print", "Comic Sans MS", ui-rounded, sans-serif;
+    font-size: 19px;
+    line-height: 1.45;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+  }
+  a { color: inherit; }
+  code { font-family: inherit; font-size: 0.92em; }
+  h1, h2, h3 { text-wrap: balance; font-weight: 400; }
+  p { text-wrap: pretty; }
+  .wrap { width: min(1040px, calc(100% - 48px)); margin: 0 auto; }
+  header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    padding: 28px 0 0;
+    font-size: 16px;
+  }
+  header a { color: var(--muted); text-decoration: none; margin-left: 18px; }
+  header a:hover, header a:focus-visible { color: var(--ink); }
+  .hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(280px, 0.95fr);
+    gap: 12px 28px;
+    align-items: center;
+    padding: 36px 0 8px;
+  }
+  .kicker { margin: 0; color: var(--muted); font-size: 16px; }
+  h1 { font-size: clamp(34px, 4.6vw, 52px); line-height: 1.05; margin: 8px 0 14px; }
+  .lede { margin: 0; max-width: 34em; }
+  .sketch { margin: 0; }
+  .sketch svg, .figure svg { width: 100%; height: auto; display: block; overflow: visible; }
+  .sketch figcaption, .caption { margin: 8px 0 0; color: var(--muted); font-size: 15px; max-width: 46em; }
+  section { padding: 52px 0 4px; }
+  h2 { font-size: 28px; margin: 0 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 18px; max-width: 40em; }
+  .figure { margin: 0 0 8px; }
+  footer { padding: 40px 0 56px; color: var(--muted); font-size: 15px; }
+  @media (max-width: 800px) {
+    .hero { grid-template-columns: 1fr; }
+    header { flex-direction: column; align-items: flex-start; gap: 8px; }
+    header nav { margin-left: -18px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span>csa</span>
+    <nav>
+      <a href="#compress">Compression</a>
+      <a href="#index">Indexer</a>
+      <a href="#attend">Attention</a>
+      <a href="#cache">Cache</a>
+    </nav>
+  </header>
+
+  <div class="hero">
+    <div>
+      <p class="kicker">DeepSeek-V4 §2.3, drawn as the PyTorch reference implements it</p>
+      <h1>Compress every m tokens. Attend to k of the results.</h1>
+      <p class="lede">Compressed Sparse Attention keeps one KV entry per block, not one per token. Each query scores those entries with a small indexer and reads only the top k, plus a short window of the tokens it just wrote.</p>
+    </div>
+    <figure class="sketch">
+      <svg viewBox="0 0 640 230" role="img" aria-labelledby="hero-title hero-desc">
+        <title id="hero-title">Overlapped compression of two blocks into one entry</title>
+        <desc id="hero-desc">Four b-stream tokens from the previous block and four a-stream tokens from the current block feed one softmax, which produces a single compressed KV entry.</desc>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M48 58 h46 v34 h-46 z"/>
+          <path d="M102 56 h46 v34 h-46 z"/>
+          <path d="M156 59 h46 v34 h-46 z"/>
+          <path d="M210 57 h46 v34 h-46 z"/>
+          <path d="M292 58 h46 v34 h-46 z"/>
+          <path d="M346 56 h46 v34 h-46 z"/>
+          <path d="M400 59 h46 v34 h-46 z"/>
+          <path d="M454 57 h46 v34 h-46 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="48" y="44">block i−1, b stream</text>
+          <text x="292" y="44">block i, a stream</text>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M70 100 C140 132 220 148 300 156"/>
+          <path d="M478 100 C420 132 360 148 328 156"/>
+          <path d="M300 156 l8 7 M300 156 l6 -5"/>
+          <path d="M248 168 h130 v46 h-130 z"/>
+        </g>
+        <text x="274" y="196" fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="18">Cᵢ comp</text>
+      </svg>
+      <figcaption>Block i reads 2m tokens: its own a-stream and the previous block’s b-stream. The sequence shrinks by m, but neighboring entries share a block.</figcaption>
+    </figure>
+  </div>
+
+  <section id="compress">
+    <h2>The two streams overlap on purpose.</h2>
+    <p class="sub">Each token is projected twice. The a-stream belongs to the block it sits in. The b-stream is saved for the next block. A softmax over those 2m positions, per channel, weights the values.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 760 348" role="img" aria-labelledby="comp-title comp-desc">
+        <title id="comp-title">How one compressed entry is mixed, and how block zero is padded</title>
+        <desc id="comp-desc">Current-block a values and previous-block b values are weighted by a softmax of their Z projections plus a positional bias. Block zero has no previous block, so its b side is zero values and negative-infinity logits.</desc>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M36 78 h70 v46 h-70 z"/>
+          <path d="M118 76 h70 v46 h-70 z"/>
+          <path d="M200 79 h70 v46 h-70 z"/>
+          <path d="M282 77 h70 v46 h-70 z"/>
+        </g>
+        <g fill="#e7e5df" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M36 148 h70 v46 h-70 z"/>
+          <path d="M118 146 h70 v46 h-70 z"/>
+          <path d="M200 149 h70 v46 h-70 z"/>
+          <path d="M282 147 h70 v46 h-70 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="56" y="106">Cᵃ</text>
+          <text x="138" y="104">Cᵃ</text>
+          <text x="220" y="107">Cᵃ</text>
+          <text x="302" y="105">Cᵃ</text>
+          <text x="56" y="176">Cᵇ</text>
+          <text x="138" y="174">Cᵇ</text>
+          <text x="220" y="177">Cᵇ</text>
+          <text x="302" y="175">Cᵇ</text>
+          <text x="36" y="58">this block, a</text>
+          <text x="36" y="214">previous block, b</text>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M360 124 C400 124 410 168 452 168"/>
+          <path d="M360 168 C400 168 410 168 452 168"/>
+          <path d="M452 168 l-8 -6 M452 168 l-8 6"/>
+          <path d="M460 112 h196 v112 h-196 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="16">
+          <text x="478" y="142">softmax over 2m</text>
+          <text x="478" y="168">of Z + bias</text>
+          <text x="478" y="198">then weight × value</text>
+        </g>
+        <g fill="none" stroke="#8a8a84" stroke-width="1.5" stroke-dasharray="4 4" stroke-linecap="round">
+          <path d="M36 252 h680 v72 h-680 z"/>
+        </g>
+        <g fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="52" y="280">block 0 has no previous b.</text>
+          <text x="52" y="304">Logits are −∞ and values are 0, so that half of the softmax drops out.</text>
+        </g>
+      </svg>
+      <figcaption>Same compressor, second copy, builds the indexer keys at width cᵢ. The picture is equations 11–12. Code: <code>_compress_from_streams</code>.</figcaption>
+    </figure>
+  </section>
+
+  <section id="index">
+    <h2>A cheap score picks the k blocks.</h2>
+    <p class="sub">The indexer does not run full attention. A shared low-rank vector makes the indexer queries, a separate projection makes a weight per head, and the score is a ReLU dot-product. Only finished blocks to the left are visible.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 760 360" role="img" aria-labelledby="idx-title idx-desc">
+        <title id="idx-title">Lightning indexer and the causal block rule</title>
+        <desc id="idx-desc">Token t builds indexer queries from a low-rank latent, scores each earlier compressed key with a ReLU dot product, and may only select blocks whose index is less than floor of t over m.</desc>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M28 46 h92 v40 h-92 z"/>
+          <path d="M28 78 C70 78 90 118 150 128"/>
+          <path d="M150 128 l-8 -5 M150 128 l-2 8"/>
+          <path d="M158 108 h86 v44 h-86 z"/>
+          <path d="M244 130 C280 130 290 64 328 56"/>
+          <path d="M328 56 l-8 2 M328 56 l-2 8"/>
+          <path d="M336 36 h150 v40 h-150 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="52" y="71">hₜ</text>
+          <text x="176" y="135">cᵗQ</text>
+          <text x="368" y="61">qᵗ, indexer</text>
+          <text x="336" y="28">eqs. 13–14</text>
+        </g>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M36 210 h120 v78 h-120 z"/>
+          <path d="M176 210 h120 v78 h-120 z"/>
+        </g>
+        <g fill="none" stroke="#8a8a84" stroke-width="1.5" stroke-dasharray="4 4" stroke-linecap="round">
+          <path d="M316 210 h120 v78 h-120 z"/>
+          <path d="M456 210 h120 v78 h-120 z"/>
+        </g>
+        <g fill="#1c1c1c">
+          <path d="M58 268 h18 v-28 h-18 z"/>
+          <path d="M84 268 h18 v-46 h-18 z"/>
+          <path d="M198 268 h18 v-16 h-18 z"/>
+          <path d="M224 268 h18 v-34 h-18 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="68" y="306">block 0</text>
+          <text x="208" y="306">block 1</text>
+          <text x="338" y="248" fill="#5e5e5a">block 2</text>
+          <text x="478" y="248" fill="#5e5e5a">block 3</text>
+          <text x="36" y="196">visible, s &lt; ⌊t/m⌋</text>
+          <text x="316" y="196" fill="#5e5e5a">t is inside block 2</text>
+        </g>
+        <text x="36" y="348" fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">score = Σₕ wₕ · ReLU(qₕ · Kₛ). Keep the k tallest bars.</text>
+      </svg>
+      <figcaption>The current block is hidden because it still contains tokens after t. The reference uses <code>s &lt; floor(t / m)</code>, which is the paper’s rule. Top-k indices that are not finite are stored as −1 and dropped.</figcaption>
+    </figure>
+  </section>
+
+  <section id="attend">
+    <h2>Core attention reads two kinds of KV.</h2>
+    <p class="sub">The selected compressed entries are the long-range memory. A sliding window of the last n_win uncompressed tokens, including the current one, covers the block the indexer is not allowed to see. One shared KV head serves every query head.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 760 300" role="img" aria-labelledby="attn-title attn-desc">
+        <title id="attn-title">Sliding window, compressed entries, sink, and the output projection</title>
+        <desc id="attn-desc">Recent uncompressed KV entries are concatenated with the selected compressed entries. An attention sink is an extra softmax logit that is dropped before mixing values. The output is rotated by the negative query position, then projected in groups back to the hidden size.</desc>
+        <g fill="#e7e5df" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M28 48 h54 v40 h-54 z"/>
+          <path d="M90 46 h54 v40 h-54 z"/>
+          <path d="M152 49 h54 v40 h-54 z"/>
+        </g>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M236 46 h70 v44 h-70 z"/>
+          <path d="M316 48 h70 v44 h-70 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="14">
+          <text x="28" y="36">window, ≤ t</text>
+          <text x="236" y="36">top-k compressed</text>
+          <text x="40" y="73">t−2</text>
+          <text x="108" y="71">t−1</text>
+          <text x="172" y="74">t</text>
+          <text x="256" y="73">Cₛ</text>
+          <text x="336" y="75">Cₛ</text>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M400 68 C430 68 440 68 468 68"/>
+          <path d="M468 68 l-8 -6 M468 68 l-8 6"/>
+          <path d="M476 40 h150 v56 h-150 z"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="492" y="64">scores</text>
+          <text x="492" y="84">+ sink logit</text>
+        </g>
+        <g fill="none" stroke="#5e5e5a" stroke-width="1.4" stroke-linecap="round">
+          <path d="M500 108 l28 16"/>
+          <path d="M528 108 l-10 8 M528 108 l8 4"/>
+        </g>
+        <text x="540" y="128" fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="14">sink column dropped</text>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M40 196 h120 v48 h-120 z"/>
+          <path d="M200 196 h130 v48 h-130 z"/>
+          <path d="M370 196 h150 v48 h-150 z"/>
+          <path d="M560 196 h110 v48 h-110 z"/>
+          <path d="M160 220 h40"/>
+          <path d="M200 220 l-8 -6 M200 220 l-8 6"/>
+          <path d="M330 220 h40"/>
+          <path d="M370 220 l-8 -6 M370 220 l-8 6"/>
+          <path d="M520 220 h40"/>
+          <path d="M560 220 l-8 -6 M560 220 l-8 6"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="16">
+          <text x="78" y="226">oₜ</text>
+          <text x="224" y="226">RoPE at −t</text>
+          <text x="396" y="226">group, then mix</text>
+          <text x="600" y="226">yₜ</text>
+        </g>
+      </svg>
+      <figcaption>Queries and the compressed KV are RMSNorm’d, then RoPE’d on the trailing channels, before this mix. Rotating the output by −t undoes the absolute position that came along because K and V are the same vector. <code>n_win = 0</code> and <code>rope_dim = 0</code> turn those two pieces off.</figcaption>
+    </figure>
+  </section>
+
+  <section id="cache">
+    <h2>The cache emits a block one token late.</h2>
+    <p class="sub">Decoding does not recompress the whole sequence. It keeps the unfinished block, the previous b-stream, the compressed entries, and the sliding window. The block becomes visible only after the token that filled it has already attended.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 760 300" role="img" aria-labelledby="cache-title cache-desc">
+        <title id="cache-title">When block zero enters the KV cache</title>
+        <desc id="cache-desc">Token 3 completes block zero but cannot read it. The block is appended after that attention. Token 4, the first token of the next block, is the first query allowed to read it.</desc>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">
+          <text x="28" y="36">writing token 3</text>
+          <text x="28" y="168">writing token 4</text>
+        </g>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round">
+          <path d="M180 16 h36 v28 h-36 z"/>
+          <path d="M222 16 h36 v28 h-36 z"/>
+          <path d="M264 16 h36 v28 h-36 z"/>
+          <path d="M306 14 h36 v28 h-36 z" fill="#e7e5df"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="14">
+          <text x="190" y="35">0</text>
+          <text x="232" y="35">1</text>
+          <text x="274" y="35">2</text>
+          <text x="316" y="33">3</text>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M360 28 h70"/>
+          <path d="M430 28 l-8 -6 M430 28 l-8 6"/>
+          <path d="M440 14 h150 v36 h-150 z" stroke-dasharray="4 4" stroke="#8a8a84"/>
+        </g>
+        <text x="468" y="36" fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">cache: no block yet</text>
+        <text x="180" y="78" fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="14">attends only the window. floor(3/m) = 0, so nothing compressed is legal.</text>
+        <g fill="#fbfaf7" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round">
+          <path d="M180 148 h36 v28 h-36 z"/>
+          <path d="M222 148 h36 v28 h-36 z"/>
+          <path d="M264 148 h36 v28 h-36 z"/>
+          <path d="M306 148 h36 v28 h-36 z"/>
+          <path d="M348 146 h36 v28 h-36 z" fill="#e7e5df"/>
+        </g>
+        <g fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="14">
+          <text x="190" y="167">0</text>
+          <text x="232" y="167">1</text>
+          <text x="274" y="167">2</text>
+          <text x="316" y="167">3</text>
+          <text x="358" y="165">4</text>
+        </g>
+        <g fill="none" stroke="#1c1c1c" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M400 160 h56"/>
+          <path d="M456 160 l-8 -6 M456 160 l-8 6"/>
+          <path d="M466 140 h150 v40 h-150 z" fill="#e7e5df"/>
+        </g>
+        <text x="500" y="165" fill="#1c1c1c" font-family="Excalifont, ui-rounded, sans-serif" font-size="16">C₀ is in</text>
+        <text x="180" y="210" fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="14">token 4 is the first query with floor(t/m) = 1, so block 0 is visible.</text>
+        <path d="M28 248 h700" fill="none" stroke="#d9d7d0" stroke-width="1.4"/>
+        <text x="28" y="278" fill="#5e5e5a" font-family="Excalifont, ui-rounded, sans-serif" font-size="15">Any chunk size, including one token, matches a full forward once the length is a multiple of m. Batch rows advance together.</text>
+      </svg>
+      <figcaption>That delay is why <code>CSA</code> in <code>src/csa/module.py</code> agrees with <code>csa_reference</code>. The unfinished block and the previous b-stream stay in <code>CSACache</code> until the next m tokens close.</figcaption>
+    </figure>
+  </section>
+
+  <footer>
+    <p>Greyscale notes for the pure-PyTorch module. Triton, cuTile, and a long-context model run are not drawn, because this tree does not implement them yet.</p>
+  </footer>
+</div>
+</body>
+</html>
