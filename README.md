@@ -9,9 +9,9 @@ The PyTorch code in `src/csa/reference.py` is meant to be readable, not fast.
 Development is on Apple Silicon with no CUDA device, so fused Triton kernels, a
 cuTile port, and long-context model demos are out of scope (resource gated). 
 
-A walk through the diagrams is at <https://jvkec.github.io/csa-cutile/>.
+A walk through the diagrams is at <https://johnkimec.github.io/csa-cutile/>.
 
-[![csa site](site/preview.png)](https://jvkec.github.io/csa-cutile/)
+[![csa site](site/preview.png)](https://johnkimec.github.io/csa-cutile/)
 
 ## Install
 
